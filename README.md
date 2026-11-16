@@ -194,6 +194,7 @@ build.ps1             PyInstaller 构建脚本
 requirements.txt      运行依赖
 installer/PDF2Office.iss          安装包脚本（Inno Setup，中文/英文向导）
 installer/build_installer.ps1     安装包构建脚本
+installer/languages/ChineseSimplified.isl   自带简体中文语言文件（Inno Setup 6.7+ 不再附带非官方翻译）
 .github/workflows/release.yml     推送 v* tag 自动构建并发布 Release
 CHANGELOG.md          变更记录
 RELEASING.md          发版流程（维护者用）
