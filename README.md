@@ -228,7 +228,7 @@ python selftest.py --quick    # 不需要 Office；完整版去掉 --quick
 
 ## 许可证
 
-本项目代码以 [MIT](LICENSE) 授权，© 2026 UNCLE-KAHN。
+本项目代码以 [MIT](LICENSE) 授权，© 2026 unclexiaoqi。
 
 第三方依赖各自保留其许可证：
 
