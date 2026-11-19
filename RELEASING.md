@@ -37,13 +37,13 @@ git push origin main --tags
 
 ## 5. 发布 Release
 
-推 `v*` tag 后，GitHub Actions 会自动构建并创建 Release（`.github/workflows/release.yml`）。
-如果 Actions 不可用，就手动发版：
+推 `v*` tag 后，GitHub Actions（`.github/workflows/release.yml`）会自动构建并创建 Release。
+**发版就走这一条路**：本地不构建发布包、也不上传附件。
 
-1. GitHub → Releases → **Draft a new release**，选 tag `vx.y.z`；
-2. 标题 `PDF2Office x.y.z`，说明从 `CHANGELOG.md` 复制；
-3. 上传三个附件：`PDF2Office-x.y.z-Setup.exe`、`PDF2Office-x.y.z-Portable.zip`、`SHA256SUMS.txt`；
-4. 发布后回填 `README.md`「下载」一节里的版本号（如果写死了）。
+> 为什么不本地上传：部分网络下本机到 `uploads.github.com` 的 TLS 会被重置，而
+> `gh release upload --clobber` 是「先删后传」，一旦传失败 Release 就变成空的。
+> 真需要手动兜底时，先用不同的附件名上传、确认成功后再删旧附件，不要直接 `--clobber`。
+> 万一已经把 Release 弄空，重新跑一次 CI 即可恢复：`gh workflow run release.yml --ref vX.Y.Z`。
 
 ## 附件内容说明
 
