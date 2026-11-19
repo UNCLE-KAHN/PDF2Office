@@ -32,7 +32,7 @@ from converter import (
 )
 
 APP_TITLE = "PDF2Office"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.0"
 SETTINGS_VERSION = 2
 
 BG = "#F4F6FB"

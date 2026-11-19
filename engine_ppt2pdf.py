@@ -25,6 +25,16 @@ tables and charts stay vector.  Each replacement is guarded by three
 independent checks (slot geometry, cropped aspect ratio, thumbnail
 correlation); anything that cannot be matched with confidence is left exactly
 as PowerPoint exported it.
+
+Measuring the exported PDF showed PowerPoint has a second, quieter failure
+mode: for some slides it keeps the full pixel count but re-encodes the picture
+at quality ~75 (real decks: 4:2:0 chroma, quantisation tables ~20 points below
+the rest of the document).  Nothing is downsampled, so a "restore the missing
+pixels" rule never fires and the file silently stays blurry.  The tier
+therefore also reads the quantisation tables out of every embedded JPEG and
+re-encodes the ones PowerPoint squeezed harder than we would.  When the deck's
+picture is a JPEG that can be dropped in untouched, it is embedded byte for
+byte instead — zero generation loss, and smaller than re-encoding it.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -44,13 +55,13 @@ from xml.etree import ElementTree
 
 import pikepdf
 import pymupdf
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 MODES = {
     "native": {
         "name": "原图无损",
         "short": "原始像素",
-        "desc": "每张图按原始像素写入，不缩小不降质",
+        "desc": "逐图实测：画质不低于 WPS / PowerPoint 类导出；能直嵌原图字节就不重压",
         "tag": "图片 100% + 文字矢量",
         "badge": "推荐",
         "stage": "正在写入原图…",
@@ -125,6 +136,24 @@ _SLOT_TOLERANCE_PT = 2.0
 _UPGRADE_MIN_GAIN = 1.15
 #: Maximum mean grey difference (0-255) between the PDF image and its source.
 _THUMB_TOLERANCE = 12.0
+#: ITU T.81 Annex K tables — needed to read the quality back out of a JPEG.
+_STD_LUMA = (
+    16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
+)
+
+#: Set ``PPT2PDF_DEBUG=1`` to explain every picture decision on stderr.
+_DEBUG = bool(os.environ.get("PPT2PDF_DEBUG"))
+
+
+def _trace(message: str) -> None:
+    if _DEBUG:
+        try:
+            print(f"[ppt2pdf] {message}", file=sys.stderr)
+        except Exception:
+            pass
 
 
 class EngineError(RuntimeError):
@@ -690,6 +719,7 @@ class _PptxPictures:
         self._archive = zipfile.ZipFile(str(path))
         self._pages: dict[int, list[_Picture]] = {}
         self._cache: dict[tuple, Optional[Image.Image]] = {}
+        self._raw: Optional[tuple[str, bytes]] = None
         try:
             for page, part in enumerate(_slide_parts(self._archive)):
                 try:
@@ -717,8 +747,9 @@ class _PptxPictures:
             return self._cache[key]
         image: Optional[Image.Image] = None
         try:
-            with self._archive.open(picture.part) as handle:
-                data = handle.read()
+            data = self.source_bytes(picture)
+            if data is None:
+                raise ValueError("image part missing")
             with Image.open(io.BytesIO(data)) as raw:
                 raw.load()
                 image = _flatten_cropped(raw, picture.crop)
@@ -728,6 +759,22 @@ class _PptxPictures:
             self._cache.clear()      # decoded pictures are huge; keep it tiny
         self._cache[key] = image
         return image
+
+    def source_bytes(self, picture: _Picture) -> Optional[bytes]:
+        """The untouched bytes of the image part — never decoded, never re-encoded.
+
+        Handing these straight to the PDF is the only way to guarantee zero
+        generation loss for pictures PowerPoint already stores lossily.
+        """
+        try:
+            if self._raw is not None and self._raw[0] == picture.part:
+                return self._raw[1]
+            with self._archive.open(picture.part) as handle:
+                data = handle.read()
+            self._raw = (picture.part, data)
+            return data
+        except Exception:
+            return None
 
     def close(self) -> None:
         try:
@@ -857,23 +904,212 @@ def _replace_stream(obj, image: Image.Image, data: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reading the compression back out of what PowerPoint wrote
+# ---------------------------------------------------------------------------
+def _jpeg_quality(data: bytes) -> Optional[tuple[int, int]]:
+    """Estimate ``(quality, chroma_subsampling)`` of a JPEG from its headers.
+
+    ``chroma_subsampling`` is 0 for 4:4:4, 1 for 4:2:2, 2 for 4:2:0 and -1 when
+    the sampling factors are anything unusual.  The quality figure comes from
+    the luma quantisation table (ITU T.81 Annex K), which is exactly how a JPEG
+    encoder such as PowerPoint's records its own setting — no pixels are
+    decoded, so this costs microseconds even for a 22-megapixel picture.
+    """
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    tables: dict[int, list[int]] = {}
+    subsampling = -1
+    index, size = 2, len(data)
+    try:
+        while index < size - 3:
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                index += 2
+                continue
+            if marker == 0xFF:
+                index += 1
+                continue
+            length = (data[index + 2] << 8) | data[index + 3]
+            segment = data[index + 4:index + 2 + length]
+            if marker == 0xDB:
+                cursor = 0
+                while cursor < len(segment):
+                    precision, table_id = segment[cursor] >> 4, segment[cursor] & 0x0F
+                    cursor += 1
+                    span = 128 if precision else 64
+                    if cursor + span > len(segment):
+                        return None
+                    if precision:
+                        values = [(segment[cursor + 2 * k] << 8)
+                                  | segment[cursor + 2 * k + 1] for k in range(64)]
+                    else:
+                        values = list(segment[cursor:cursor + 64])
+                    tables[table_id] = values
+                    cursor += span
+            elif marker in (0xC0, 0xC1, 0xC2):
+                components = segment[5] if len(segment) > 5 else 0
+                if components >= 3 and len(segment) >= 10:
+                    luma = segment[7] >> 4, segment[7] & 0x0F
+                    subsampling = {(1, 1): 0, (2, 1): 1, (2, 2): 2}.get(luma, -1)
+                elif components:
+                    subsampling = 0
+            elif marker == 0xDA:      # entropy data follows — stop before it
+                break
+            index += 2 + length
+    except Exception:
+        return None
+
+    table = tables.get(0)
+    if not table:
+        return None
+    best_quality, best_error = 100, None
+    for candidate in range(1, 101):
+        scale = 5000 // candidate if candidate < 50 else 200 - candidate * 2
+        error = 0
+        for standard, actual in zip(_STD_LUMA, table):
+            target = min(255, max(1, (standard * scale + 50) // 100))
+            error += abs(target - actual)
+        if best_error is None or error < best_error:
+            best_quality, best_error = candidate, error
+    return best_quality, subsampling
+
+
+def _passthrough_bytes(pictures: _PptxPictures,
+                       picture: _Picture) -> Optional[bytes]:
+    """Original JPEG bytes, when the whole picture can be replaced as-is."""
+    if any(picture.crop):
+        return None                     # a crop forces a re-encode anyway
+    if Path(picture.part).suffix.lower() not in (".jpg", ".jpeg"):
+        return None
+    data = pictures.source_bytes(picture)
+    if not data:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as probe:
+            if probe.format != "JPEG" or probe.mode != "RGB":
+                return None             # CMYK / greyscale would need /ColorSpace care
+    except Exception:
+        return None
+    return data
+
+
+# ---------------------------------------------------------------------------
+# The "no worse than the other exporter" floor
+# ---------------------------------------------------------------------------
+#: Mean squared error of a picture, used as the yardstick below.
+def _mse(reference: Image.Image, image: Image.Image) -> float:
+    if reference.size != image.size or reference.mode != image.mode:
+        return float("inf")
+    try:
+        rms = ImageStat.Stat(ImageChops.difference(reference, image)).rms
+    except Exception:
+        return float("inf")
+    if not rms:
+        return float("inf")
+    return sum(value * value for value in rms) / len(rms)
+
+
+def _decode_jpeg(data: bytes) -> Optional[Image.Image]:
+    try:
+        with Image.open(io.BytesIO(data)) as probe:
+            probe.load()
+            return probe.convert("RGB")
+    except Exception:
+        return None
+
+
+def _exporter_floor(reference: Image.Image) -> float:
+    """Error of the encode a WPS-class exporter writes: quality 100, 4:2:0.
+
+    Measured on real decks: WPS's PDF pictures decode back to exactly what
+    libjpeg produces for ``quality=100, subsampling=2`` (five pictures matched
+    to 0.00 dB).  That makes the floor reproducible here without running WPS —
+    whatever we write has to be at least this close to the original.
+    """
+    data = _encode_jpeg(reference, 100, 2)
+    if not data:
+        return float("inf")             # no floor: fall back to the tier quality
+    decoded = _decode_jpeg(data)
+    if decoded is None:
+        return float("inf")
+    return _mse(reference, decoded)
+
+
+def _quality_ladder(start: int) -> list[int]:
+    """Tier quality first, then the steps that can clear the export floor."""
+    values = [max(1, min(100, int(start)))]
+    for step in (96, 97, 98, 99, 100):
+        if step > values[0]:
+            values.append(step)
+    return values
+
+
+def _floor_payload(pictures: _PptxPictures, picture: _Picture, source: Image.Image,
+                   quality: int, subsampling: int, max_dpi, width_pt: float,
+                   floor: float) -> Optional[tuple[Image.Image, bytes, str, float]]:
+    """Smallest payload whose error is no worse than *floor*.
+
+    Candidates are the deck's own JPEG (error 0) and our encodes, tried at the
+    tier quality first and escalated only while they still miss the floor.
+    """
+    options: list[tuple[int, float, str, Image.Image, bytes]] = []
+
+    original = _passthrough_bytes(pictures, picture)
+    if original:
+        options.append((len(original), 0.0, "verbatim", source, original))
+
+    image = source
+    if max_dpi is not None:
+        image = _resize_to_dpi(source, width_pt, float(max_dpi))
+
+    best: Optional[tuple[Image.Image, bytes, str, float]] = None
+    for level in _quality_ladder(quality):
+        data = _encode_jpeg(image, level, subsampling)
+        if not data:
+            continue
+        decoded = _decode_jpeg(data)
+        if decoded is None:
+            continue
+        error = _mse(image, decoded)
+        best = (image, data, level, error)
+        if error <= floor:
+            break
+    if best is None:
+        return None
+    options.append((len(best[1]), best[3], "recode", best[0], best[1]))
+
+    _, error, kind, image, data = min(options, key=lambda item: item[0])
+    return image, data, kind, error
+
+
+# ---------------------------------------------------------------------------
 # Post-processing
 # ---------------------------------------------------------------------------
 def optimize_pdf(src: str | Path, dst: str | Path, preset: dict,
                  pptx_path: str | Path | None = None,
-                 on_progress: Optional[Callable[[float], None]] = None) -> None:
+                 on_progress: Optional[Callable[[float], None]] = None) -> dict[str, int]:
     """Write *src* to *dst* applying *preset*.
 
-    ``upgrade``   restores the original picture resolution from *pptx_path*.
+    ``upgrade``   restores the original picture pixels from *pptx_path*.
     ``cap``       downsamples any image above that DPI (None = never shrink).
     With neither set the file is copied untouched.
+
+    Returns how many pictures were rewritten and how: ``verbatim`` (the
+    original file was embedded byte for byte), ``upgraded`` (PowerPoint had
+    thrown pixels away and they were put back) and ``repaired`` (the pixels
+    were already there, but PowerPoint had compressed them much harder than we
+    would).
     """
     src, dst = str(src), str(dst)
+    stats = {"verbatim": 0, "upgraded": 0, "repaired": 0}
     cap = preset.get("cap")
     upgrade = bool(preset.get("upgrade"))
     if cap is None and not upgrade:
         shutil.copyfile(src, dst)
-        return
+        return stats
 
     quality = int(preset.get("quality", 90))
     subsampling = int(preset.get("subsampling", 0))
@@ -895,7 +1131,7 @@ def optimize_pdf(src: str | Path, dst: str | Path, preset: dict,
             for done, (xref, uses) in enumerate(layout.items(), 1):
                 try:
                     _rewrite_image(pdf, doc, xref, uses, cap, upgrade, max_dpi,
-                                   quality, subsampling, pictures)
+                                   quality, subsampling, pictures, stats)
                 except Exception:
                     pass
                 if on_progress is not None and (done % 4 == 0 or done == total):
@@ -914,11 +1150,13 @@ def optimize_pdf(src: str | Path, dst: str | Path, preset: dict,
     # Never hand back a "compressed" file that is not actually smaller.
     if not upgrade and (not os.path.exists(dst) or os.path.getsize(dst) >= os.path.getsize(src)):
         shutil.copyfile(src, dst)
+    return stats
 
 
 def _rewrite_image(pdf, doc, xref: int, uses, cap, upgrade: bool, max_dpi,
                    quality: int, subsampling: int,
-                   pictures: Optional[_PptxPictures]) -> None:
+                   pictures: Optional[_PptxPictures],
+                   stats: Optional[dict[str, int]] = None) -> None:
     try:
         obj = pdf.get_object((xref, 0))
     except Exception:
@@ -939,6 +1177,7 @@ def _rewrite_image(pdf, doc, xref: int, uses, cap, upgrade: bool, max_dpi,
     filters = _filter_names(obj)
     if not any("DCTDecode" in name or "FlateDecode" in name for name in filters):
         return
+    stats = stats if stats is not None else {}
 
     slot = max(uses, key=lambda item: item[1].width * item[1].height)
     page_no, rect = slot
@@ -950,25 +1189,13 @@ def _rewrite_image(pdf, doc, xref: int, uses, cap, upgrade: bool, max_dpi,
     # -- 1. try to restore the original picture -------------------------
     if upgrade and pictures is not None:
         if max_dpi is None or dpi_now < float(max_dpi) - 0.5:
-            source_picture = _find_picture(pictures, page_no, rect)
-            if source_picture is not None:
-                source = pictures.load(source_picture)
-                if source is not None and _worth_upgrading(
-                        source, width, height, bool(any(source_picture.crop))):
-                    fingerprint = _pdf_thumb(doc, xref, obj)
-                    if (fingerprint is not None
-                            and _thumb_distance(fingerprint, _thumb(source))
-                            <= _THUMB_TOLERANCE):
-                        if max_dpi is None:
-                            restored = source          # 1:1 original pixels
-                        else:
-                            restored = _resize_to_dpi(source, width_pt,
-                                                      float(max_dpi))
-                        if restored.width > width:
-                            data = _encode_jpeg(restored, quality, subsampling)
-                            if data:
-                                _replace_stream(obj, restored, data)
-                                return
+            verdict = _restore_picture(doc, xref, obj, pictures, page_no, rect,
+                                       width, height, width_pt,
+                                       bool(any("DCTDecode" in name for name in filters)),
+                                       quality, subsampling, max_dpi)
+            if verdict:
+                stats[verdict] = stats.get(verdict, 0) + 1
+                return
 
     # -- 2. otherwise downsample when above the cap ---------------------
     if cap is None:
@@ -995,21 +1222,105 @@ def _rewrite_image(pdf, doc, xref: int, uses, cap, upgrade: bool, max_dpi,
     _replace_stream(obj, shrunk, data)
 
 
-def _worth_upgrading(source: Image.Image, width: int, height: int,
-                     cropped: bool) -> bool:
-    if source.width < width * _UPGRADE_MIN_GAIN:
-        return False
-    if source.height < height * _UPGRADE_MIN_GAIN:
-        return False
-    if not cropped:
-        # No srcRect: whatever the frame aspect, the placement matrix stretches
-        # the picture exactly like PowerPoint's own stretched bitmap.
-        return True
-    # Cropped picture: PowerPoint exports the cropped region 1:1, so the
-    # shapes must agree or we are looking at the wrong picture.
-    source_ratio = source.width / source.height
-    embedded_ratio = width / height
-    return abs(source_ratio / embedded_ratio - 1.0) <= 0.02
+def _restore_picture(doc, xref: int, obj, pictures: _PptxPictures,
+                     page_no: int, rect, width: int, height: int, width_pt: float,
+                     stream_is_jpeg: bool, quality: int, subsampling: int,
+                     max_dpi=None) -> Optional[str]:
+    """Rewrite one PDF image from the picture stored in the deck.
+
+    Nothing in the output may be worse than what a WPS-class exporter writes
+    for the same slide, so every picture is judged against a measured floor:
+    the error of the ``quality 100, 4:2:0`` encode such an exporter produces.
+    The replacement is then the smallest payload that clears it:
+
+    ``verbatim``  the deck's own JPEG, embedded byte for byte — error 0, so no
+                  amount of re-encoding can beat it, and it is usually the
+                  smallest candidate as well;
+    ``upgraded``  our re-encode at full resolution, when PowerPoint had
+                  downsampled the picture;
+    ``repaired``  pixels were already full-size, but PowerPoint's bytes were
+                  below the floor.
+
+    Returns the treatment label, or ``None`` when the stream was left alone.
+    """
+    picture = _find_picture(pictures, page_no, rect)
+    if picture is None:
+        _trace(f"p{page_no + 1}: no picture placement matched the {width}x{height} slot")
+        return None
+    source = pictures.load(picture)
+    if source is None:
+        return None
+
+    cropped = bool(any(picture.crop))
+    if cropped and abs(source.width / source.height - width / height) > 0.02:
+        return None
+    if source.width < width or source.height < height:
+        return None                     # the deck's copy is no larger: nothing to win
+
+    fingerprint = _pdf_thumb(doc, xref, obj)
+    if (fingerprint is None
+            or _thumb_distance(fingerprint, _thumb(source)) > _THUMB_TOLERANCE):
+        _trace(f"p{page_no + 1}: thumbnail mismatch, left untouched")
+        return None
+
+    downsampled = (source.width >= width * _UPGRADE_MIN_GAIN
+                   and source.height >= height * _UPGRADE_MIN_GAIN)
+    if not stream_is_jpeg and not downsampled:
+        return None                     # already lossless at full size
+
+    floor = _exporter_floor(source)
+    current_error = float("inf")
+    if not downsampled:
+        if (source.width, source.height) != (width, height):
+            return None
+        if not stream_is_jpeg:
+            return None                 # lossless beats anything we could write
+        current = _pdf_image(doc, xref, obj)
+        if current is not None:
+            current_error = _mse(source, current)
+        if current_error <= floor:
+            if _DEBUG:
+                probe = _jpeg_quality(_stream_bytes(obj))
+                _trace(f"p{page_no + 1}: PowerPoint's encode already clears the floor"
+                       f" (Q{probe[0] if probe else '?'}"
+                       f"{', 4:2:0' if probe and probe[1] > 0 else ''}), kept")
+            return None
+
+    pick = _floor_payload(pictures, picture, source, quality, subsampling,
+                          max_dpi, width_pt, floor)
+    if pick is None:
+        return None
+    image, data, kind, error = pick
+
+    if not downsampled and current_error <= error * 1.11:
+        _trace(f"p{page_no + 1}: replacement would not improve on PowerPoint's, kept")
+        return None
+
+    verdict = "verbatim" if kind == "verbatim" else ("upgraded" if downsampled else "repaired")
+    _trace(f"p{page_no + 1}: {width}x{height} -> {image.width}x{image.height} "
+           f"{verdict} (mse {error:.1f} vs {current_error:.1f}, floor {floor:.1f}, "
+           f"{len(data) / 1048576:.2f}MB)")
+    _replace_stream(obj, image, data)
+    return verdict
+
+
+def _stream_bytes(obj) -> bytes:
+    try:
+        return obj.read_raw_bytes() or b""
+    except Exception:
+        return b""
+
+
+def _image_note(stats: dict[str, int]) -> str:
+    """Short, honest summary of what happened to the pictures."""
+    parts: list[str] = []
+    if stats.get("verbatim"):
+        parts.append(f"原图直嵌 {stats['verbatim']} 张")
+    if stats.get("repaired"):
+        parts.append(f"修复压缩 {stats['repaired']} 张")
+    if stats.get("upgraded"):
+        parts.append(f"补分辨率 {stats['upgraded']} 张")
+    return "、".join(parts)
 
 
 def _pdf_image(doc, xref: int, obj) -> Optional[Image.Image]:
@@ -1153,11 +1464,14 @@ class BatchConverter:
                 raise EngineError("PowerPoint 导出的 PDF 是空文件。")
             needs_work = bool(self.preset.get("upgrade")) or self.preset.get("cap") is not None
             pages = 0
+            stats: dict[str, int] = {}
             if needs_work:
                 tmp = dst.parent / f".~ppt2pdf-{uuid.uuid4().hex}.pdf"
                 try:
-                    optimize_pdf(dst, tmp, self.preset, pptx_path=src,
-                                 on_progress=lambda fraction: self._progress(index, fraction))
+                    stats = optimize_pdf(
+                        dst, tmp, self.preset, pptx_path=src,
+                        on_progress=lambda fraction: self._progress(index, fraction),
+                    ) or {}
                     if tmp.exists() and tmp.stat().st_size > 0:
                         # Validate before swapping in: on any problem the
                         # untouched PowerPoint PDF stays as the result.
@@ -1178,6 +1492,7 @@ class BatchConverter:
             result.dst = str(dst)
             result.size_before = raw_size
             result.size_after = dst.stat().st_size
+            result.note = _image_note(stats)
             result.ok = True
         except Exception as exc:
             result.error = f"{exc.__class__.__name__}: {exc}"

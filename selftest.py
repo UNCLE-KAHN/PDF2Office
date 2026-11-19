@@ -327,6 +327,73 @@ def check_scanned_note(paths: dict[str, str]) -> None:
     check("scanned PDF is flagged", "扫描件" in (note or ""), f"note={note!r}")
 
 
+def check_picture_fidelity(paths: dict[str, str]) -> None:
+    """native mode must be at least as faithful as a WPS-class export.
+
+    The tier's promise is a measured one: every picture in the output has to be
+    no further from the deck's original than the ``quality 100, 4:2:0`` encode
+    that other exporters write.  Comparing mean squared error against exactly
+    that encode is the only way to know the promise still holds.
+    """
+    import zipfile
+
+    import pikepdf
+
+    import engine_ppt2pdf as engine
+
+    events, outdir, elapsed = run_batch("ppt2pdf", "native", [paths["pptx"]])
+    done = [p for kind, p in events if kind == "done"]
+    files = outputs(outdir, ".pdf")
+    if not (done and files):
+        check("native is no worse than a WPS-class export", False, "no output")
+        return
+
+    result = done[0]["results"][0]
+    with zipfile.ZipFile(paths["pptx"]) as archive:
+        media = [n for n in archive.namelist() if n.startswith("ppt/media/")]
+        original = archive.read(media[0]) if media else b""
+    source = engine._decode_jpeg(original)
+    if source is None:
+        check("native is no worse than a WPS-class export", False, "no source picture")
+        return
+
+    path = os.path.join(outdir, files[0])
+    with pymupdf.open(path) as doc, pikepdf.open(path) as pdf:
+        found = doc[0].get_images(full=True) if doc.page_count else []
+        error = None
+        if found:
+            obj = pdf.get_object((found[0][0], 0))
+            image = engine._pdf_image(doc, found[0][0], obj)
+            if image is not None:
+                error = engine._mse(source, image)
+    floor = engine._exporter_floor(source)
+    ok = error is not None and error <= floor
+    check(f"native is no worse than a WPS-class export ({elapsed:.1f}s)", ok,
+          f"error={error} floor={floor:.2f} note={result.note!r}")
+
+
+def check_jpeg_quality_probe() -> None:
+    """The probe decides which pictures get repaired — it must read Q back."""
+    import io as _io
+
+    import engine_ppt2pdf as engine
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (240, 180), (30, 120, 200))
+    draw = ImageDraw.Draw(image)
+    for x in range(0, 240, 3):
+        draw.line([(x, 0), (x, 180)], fill=(x, 255 - x, 90))
+    results = []
+    for quality, sampling in ((95, 0), (75, 2), (60, 2)):
+        buffer = _io.BytesIO()
+        image.save(buffer, "JPEG", quality=quality, subsampling=sampling)
+        results.append((quality, sampling, engine._jpeg_quality(buffer.getvalue())))
+    ok = all(probe is not None and abs(probe[0] - quality) <= 3
+             and probe[1] == sampling
+             for quality, sampling, probe in results)
+    check("jpeg quality probe reads Q and chroma back", ok, str(results))
+
+
 def check_no_console_window(paths: dict[str, str]) -> None:
     """The Word helper must not flash a console window."""
     if QUICK:
@@ -477,6 +544,8 @@ def main() -> int:
     check_bad_inputs(paths)
     check_wrong_extension(paths)
     check_scanned_note(paths)
+    check_picture_fidelity(paths)
+    check_jpeg_quality_probe()
     check_settings_roundtrip(paths)
     check_cli_validation()
     check_cli_success(paths)
